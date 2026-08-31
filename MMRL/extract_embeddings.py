@@ -144,10 +144,10 @@ def parse_args():
     )
 
     parser.add_argument(
-        "--output_pids",
+        "--output_ids",
         type=str,
         required=True,
-        help="输出 patient id 的 .tsv 文件"
+        help="输出 sample id 的 .tsv 文件"
     )
 
     parser.add_argument(
