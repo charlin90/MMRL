@@ -3,8 +3,9 @@
 
 Supported workflows
 -------------------
-1) VCF -> vcf2maf/VEP (+ optional AlphaMissense plugin) -> MMRL TSV
-2) Existing MAF/MAF-like TSV -> MMRL TSV
+1) Single VCF -> vcf2maf/VEP -> direct AlphaMissense lookup -> MMRL TSV
+2) VCF directory -> per-sample vcf2maf/VEP -> one shared AlphaMissense scan -> combined MMRL TSV
+3) Existing MAF/MAF-like TSV -> optional direct AlphaMissense lookup -> MMRL TSV
 
 The final output contains:
     Hugo_Symbol, SBS96, am_pathogenicity, Tumor_Sample_Barcode,
@@ -74,15 +75,10 @@ def resolve_executable_or_file(value: str) -> str:
     raise FileNotFoundError(f"Cannot find executable/file: {value}")
 
 
-def validate_alphamissense_files(path: Path) -> None:
+def validate_alphamissense_file(path: Path) -> None:
+    """Validate the AlphaMissense lookup table used by the direct Python annotator."""
     if not path.exists():
         raise FileNotFoundError(f"AlphaMissense file not found: {path}")
-    # VEP AlphaMissense plugin uses tabix-indexed files.
-    if not Path(str(path) + ".tbi").exists():
-        log(
-            "Warning: AlphaMissense tabix index (.tbi) was not found. "
-            "The VEP AlphaMissense plugin normally requires a tabix-indexed file."
-        )
 
 
 def run_vcf2maf(args: argparse.Namespace, output_maf: Path) -> Path:
@@ -101,7 +97,6 @@ def run_vcf2maf(args: argparse.Namespace, output_maf: Path) -> Path:
         "--ref-fasta", str(Path(args.ref_fasta).expanduser().resolve()),
         "--ncbi-build", args.ncbi_build,
         "--vep-forks", str(args.vep_forks),
-        "--retain-ann", "am_pathogenicity,am_class",
     ]
 
     if args.tumor_id:
@@ -122,19 +117,6 @@ def run_vcf2maf(args: argparse.Namespace, output_maf: Path) -> Path:
         cmd += ["--tmp-dir", str(Path(args.tmp_dir).expanduser().resolve())]
     if args.verbose_vcf2maf:
         cmd += ["--verbose"]
-
-    if args.alphamissense_file:
-        am_file = Path(args.alphamissense_file).expanduser().resolve()
-        validate_alphamissense_files(am_file)
-        cmd += [
-            "--vep-plugins",
-            f"AlphaMissense,file={am_file},cols=all",
-        ]
-    else:
-        log(
-            "Warning: --alphamissense-file was not supplied. The final table will only "
-            "be complete if am_pathogenicity is already present in the resulting MAF."
-        )
 
     run_command(cmd)
     return output_maf
@@ -286,10 +268,178 @@ def add_sbs96(df: pd.DataFrame, ref_fasta: Path) -> pd.DataFrame:
 
 
 def open_text_auto(path: Path):
-    if str(path).endswith(".gz"):
+    lower = str(path).lower()
+    if lower.endswith((".gz", ".bgz", ".bgzf")):
         return gzip.open(path, "rt")
     return open(path, "rt")
 
+
+def normalize_alphamissense_chromosome(value) -> str:
+    """Normalize chromosome names to the chr-prefixed convention used by AlphaMissense."""
+    chrom = str(value).strip()
+    if chrom.startswith("chr"):
+        chrom = chrom[3:]
+    if chrom in {"M", "MT"}:
+        chrom = "M"
+    return "chr" + chrom
+
+
+def generate_alphamissense_lookup_keys(df: pd.DataFrame) -> Tuple[set[str], pd.Series]:
+    """Build CHROM:POS:REF:ALT lookup keys from MAF columns."""
+    required = [
+        "Chromosome", "Start_Position", "Reference_Allele", "Tumor_Seq_Allele2"
+    ]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(
+            f"Cannot annotate AlphaMissense; missing MAF columns: {missing}"
+        )
+
+    chrom = df["Chromosome"].map(normalize_alphamissense_chromosome)
+    pos = pd.to_numeric(df["Start_Position"], errors="coerce").astype("Int64")
+    ref = df["Reference_Allele"].astype(str).str.upper()
+    alt = df["Tumor_Seq_Allele2"].astype(str).str.upper()
+
+    valid = pos.notna()
+    keys = pd.Series(pd.NA, index=df.index, dtype="object")
+    keys.loc[valid] = (
+        chrom.loc[valid]
+        + ":"
+        + pos.loc[valid].astype(str)
+        + ":"
+        + ref.loc[valid]
+        + ":"
+        + alt.loc[valid]
+    )
+    return set(keys.dropna()), keys
+
+
+def _find_alphamissense_header(handle) -> list[str]:
+    """Find either '#CHROM ...' or 'CHROM ...' AlphaMissense header."""
+    required = {
+        "CHROM", "POS", "REF", "ALT", "am_pathogenicity", "am_class"
+    }
+    for line in handle:
+        stripped = line.rstrip("\r\n")
+        if not stripped:
+            continue
+
+        candidate = stripped[1:] if stripped.startswith("#CHROM\t") else stripped
+        fields = candidate.split("\t")
+        if required.issubset(fields):
+            return fields
+
+    raise ValueError(
+        "Could not find an AlphaMissense header containing "
+        "CHROM, POS, REF, ALT, am_pathogenicity and am_class."
+    )
+
+
+def scan_alphamissense_database(
+    keys_to_find: set[str],
+    db_path: Path,
+    chunk_size: int = 1_000_000,
+) -> Tuple[Dict[str, object], Dict[str, object]]:
+    """Scan AlphaMissense once and return score/class maps for requested lookup keys."""
+    validate_alphamissense_file(db_path)
+    found_scores: Dict[str, object] = {}
+    found_classes: Dict[str, object] = {}
+    if not keys_to_find:
+        return found_scores, found_classes
+
+    usecols = ["CHROM", "POS", "REF", "ALT", "am_pathogenicity", "am_class"]
+    with open_text_auto(db_path) as handle:
+        header = _find_alphamissense_header(handle)
+        reader = pd.read_csv(
+            handle,
+            sep="\t",
+            names=header,
+            header=None,
+            comment="#",
+            chunksize=chunk_size,
+            usecols=usecols,
+            dtype={
+                "CHROM": str,
+                "POS": "Int64",
+                "REF": str,
+                "ALT": str,
+                "am_pathogenicity": str,
+                "am_class": str,
+            },
+            low_memory=False,
+        )
+
+        pbar = tqdm(reader, desc="AlphaMissense", unit="chunk")
+        for chunk in pbar:
+            chunk = chunk.dropna(subset=["CHROM", "POS", "REF", "ALT"]).copy()
+            if chunk.empty:
+                continue
+
+            chrom = chunk["CHROM"].map(normalize_alphamissense_chromosome)
+            chunk["lookup_key"] = (
+                chrom
+                + ":"
+                + chunk["POS"].astype(str)
+                + ":"
+                + chunk["REF"].astype(str).str.upper()
+                + ":"
+                + chunk["ALT"].astype(str).str.upper()
+            )
+
+            matches = chunk[chunk["lookup_key"].isin(keys_to_find)]
+            if not matches.empty:
+                for row in matches.itertuples(index=False):
+                    key = row.lookup_key
+                    found_scores[key] = row.am_pathogenicity
+                    found_classes[key] = row.am_class
+
+            pbar.set_postfix(found=len(found_scores))
+            if len(found_scores) == len(keys_to_find):
+                break
+        pbar.close()
+
+    log(
+        "AlphaMissense direct lookup: "
+        f"{len(found_scores):,}/{len(keys_to_find):,} unique variants matched"
+    )
+    return found_scores, found_classes
+
+
+def apply_alphamissense_map(
+    df: pd.DataFrame,
+    found_scores: Dict[str, object],
+    found_classes: Dict[str, object],
+) -> Tuple[pd.DataFrame, Dict[str, int]]:
+    """Apply a previously scanned AlphaMissense lookup map to one mutation table."""
+    keys_to_find, lookup_series = generate_alphamissense_lookup_keys(df)
+    out = df.copy()
+    out["am_pathogenicity"] = lookup_series.map(found_scores)
+    out["am_class"] = lookup_series.map(found_classes)
+    matched_keys = set(lookup_series[out["am_pathogenicity"].notna()].dropna())
+    stats = {
+        "alphamissense_lookup_keys": int(len(keys_to_find)),
+        "alphamissense_matched_keys": int(len(matched_keys)),
+    }
+    return out, stats
+
+
+def annotate_alphamissense_direct(
+    df: pd.DataFrame,
+    db_path: Path,
+    chunk_size: int = 1_000_000,
+) -> Tuple[pd.DataFrame, Dict[str, int]]:
+    """Annotate AlphaMissense by directly matching CHROM:POS:REF:ALT.
+
+    This intentionally does not use the VEP AlphaMissense plugin. It supports
+    plain TSV, gzip, bgzip (.bgz/.bgzf), and both '#CHROM' and 'CHROM' headers.
+    """
+    keys_to_find, _ = generate_alphamissense_lookup_keys(df)
+    found_scores, found_classes = scan_alphamissense_database(
+        keys_to_find,
+        db_path=db_path,
+        chunk_size=chunk_size,
+    )
+    return apply_alphamissense_map(df, found_scores, found_classes)
 
 def load_transcript_lengths(protein_fasta: Path) -> Dict[str, int]:
     """Load transcript -> protein length from an Ensembl peptide FASTA.
@@ -326,19 +476,32 @@ def load_transcript_lengths(protein_fasta: Path) -> Dict[str, int]:
     log(f"Loaded protein lengths for {len(lengths):,} transcripts")
     return lengths
 
-
 def parse_protein_position(value) -> Tuple[Optional[float], Optional[float]]:
     if pd.isna(value):
         return None, None
+
     text = str(value).strip()
-    # Examples handled: 379/393, 379-380/393, 379, 379-380
-    match = re.match(r"^(\d+)(?:-\d+)?(?:/(\d+))?$", text)
+
+    # Handle values read by pandas as floats:
+    #   379.0
+    #   379.0/393.0
+    # as well as standard VEP forms:
+    #   379
+    #   379-380
+    #   379/393
+    #   379-380/393
+    match = re.match(
+        r"^(\d+(?:\.0+)?)(?:-\d+(?:\.0+)?)?(?:/(\d+(?:\.0+)?))?$",
+        text,
+    )
+
     if not match:
         return None, None
+
     pos = float(match.group(1))
     total = float(match.group(2)) if match.group(2) else None
-    return pos, total
 
+    return pos, total
 
 def normalize_hgvsp_to_one_letter(text: str) -> str:
     out = text
@@ -432,12 +595,16 @@ def normalize_alphamissense_column(
 
     raise ValueError(
         "AlphaMissense pathogenicity score column was not found. "
-        "For VCF input, pass --alphamissense-file so vcf2maf/VEP can annotate it; "
-        "for MAF input, use --alphamissense-column if your column has a custom name."
+        "Pass --alphamissense-file for direct CHROM:POS:REF:ALT annotation, "
+        "or use --alphamissense-column when an existing MAF already contains the score."
     )
 
 
-def prepare_features(args: argparse.Namespace, maf_path: Path) -> Tuple[pd.DataFrame, dict]:
+def prepare_features_before_alphamissense(
+    args: argparse.Namespace,
+    maf_path: Path,
+) -> Tuple[pd.DataFrame, dict]:
+    """Prepare missense/SBS96/protein features before AlphaMissense annotation."""
     df = read_maf(maf_path)
     df, qc = filter_missense_somatic(
         df,
@@ -456,8 +623,16 @@ def prepare_features(args: argparse.Namespace, maf_path: Path) -> Tuple[pd.DataF
     df = add_protein_features(df, protein_fasta=protein_fasta)
     qc["aachange_non_missing"] = int(df["AAchange"].notna().sum())
     qc["relative_position_non_missing"] = int(df["Relative_Position"].notna().sum())
+    return df, qc
 
-    df = normalize_alphamissense_column(df, args.alphamissense_column)
+
+def finalize_features(
+    df: pd.DataFrame,
+    qc: dict,
+    allow_empty: bool = False,
+) -> Tuple[pd.DataFrame, dict]:
+    """Finalize QC and complete-case filtering after AlphaMissense is available."""
+    df = df.copy()
     df["am_pathogenicity"] = pd.to_numeric(df["am_pathogenicity"], errors="coerce")
     qc["alphamissense_non_missing"] = int(df["am_pathogenicity"].notna().sum())
 
@@ -475,14 +650,289 @@ def prepare_features(args: argparse.Namespace, maf_path: Path) -> Tuple[pd.DataF
     qc["final_rows"] = int(len(final))
     qc["final_samples"] = int(final["Tumor_Sample_Barcode"].nunique())
 
-    if final.empty:
+    if final.empty and not allow_empty:
         raise ValueError(
             "No complete MMRL mutation rows remain after preprocessing. "
             "Check the QC report and AlphaMissense/SBS96/protein-position annotations."
         )
-
     return final, {"qc": qc, "annotated": df}
 
+
+def prepare_features(args: argparse.Namespace, maf_path: Path) -> Tuple[pd.DataFrame, dict]:
+    df, qc = prepare_features_before_alphamissense(args, maf_path)
+
+    if args.alphamissense_file:
+        am_path = Path(args.alphamissense_file).expanduser().resolve()
+        df, am_stats = annotate_alphamissense_direct(
+            df,
+            db_path=am_path,
+            chunk_size=args.alphamissense_chunk_size,
+        )
+        qc.update(am_stats)
+    else:
+        df = normalize_alphamissense_column(df, args.alphamissense_column)
+
+    return finalize_features(df, qc)
+
+
+def vcf_basename(path: Path) -> str:
+    """Return a stable filename stem for .vcf/.vcf.gz/.vcf.bgz/.vcf.bgzf."""
+    name = path.name
+    for suffix in (".vcf.bgzf", ".vcf.bgz", ".vcf.gz", ".vcf"):
+        if name.lower().endswith(suffix):
+            return name[:-len(suffix)]
+    return path.stem
+
+
+def is_vcf_path(path: Path) -> bool:
+    lower = path.name.lower()
+    return any(lower.endswith(x) for x in (".vcf", ".vcf.gz", ".vcf.bgz", ".vcf.bgzf"))
+
+
+def discover_vcfs(directory: Path, recursive: bool = False) -> list[Path]:
+    if not directory.exists() or not directory.is_dir():
+        raise NotADirectoryError(f"VCF directory not found: {directory}")
+    iterator = directory.rglob("*") if recursive else directory.glob("*")
+    vcfs = sorted(p.resolve() for p in iterator if p.is_file() and is_vcf_path(p))
+    if not vcfs:
+        raise FileNotFoundError(f"No .vcf/.vcf.gz files found under: {directory}")
+    return vcfs
+
+
+def read_vcf_sample_names(path: Path) -> list[str]:
+    """Read genotype sample names directly from the #CHROM VCF header."""
+    with open_text_auto(path) as handle:
+        for line in handle:
+            if line.startswith("#CHROM\t"):
+                fields = line.rstrip("\r\n").split("\t")
+                return fields[9:] if len(fields) > 9 else []
+    raise ValueError(f"VCF #CHROM header not found: {path}")
+
+
+def stage_plain_vcf(input_vcf: Path, sample_work_dir: Path) -> Path:
+    """Stage a plain .vcf in the batch work directory; decompress when necessary."""
+    sample_work_dir.mkdir(parents=True, exist_ok=True)
+    staged = sample_work_dir / f"{vcf_basename(input_vcf)}.vcf"
+    if staged.exists() or staged.is_symlink():
+        staged.unlink()
+
+    lower = input_vcf.name.lower()
+    if lower.endswith((".vcf.gz", ".vcf.bgz", ".vcf.bgzf")):
+        log(f"Decompressing for vcf2maf: {input_vcf.name}")
+        with gzip.open(input_vcf, "rb") as src, open(staged, "wb") as dst:
+            shutil.copyfileobj(src, dst)
+    else:
+        try:
+            staged.symlink_to(input_vcf.resolve())
+        except OSError:
+            shutil.copy2(input_vcf, staged)
+
+    stale_vep = staged.with_name(staged.name[:-4] + ".vep.vcf")
+    if stale_vep.exists():
+        stale_vep.unlink()
+    return staged
+
+
+def write_json(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w") as handle:
+        json.dump(payload, handle, indent=2, ensure_ascii=False)
+
+
+def run_vcf_directory(args: argparse.Namespace, output: Path) -> None:
+    """Batch-process one tumor VCF per file and scan AlphaMissense only once."""
+    input_dir = Path(args.input_vcf_dir).expanduser().resolve()
+    vcfs = discover_vcfs(input_dir, recursive=args.recursive)
+    work_dir = (
+        Path(args.batch_work_dir).expanduser().resolve()
+        if args.batch_work_dir
+        else Path(str(output) + ".batch")
+    )
+    work_dir.mkdir(parents=True, exist_ok=True)
+    log(f"Batch mode: discovered {len(vcfs):,} VCF file(s) under {input_dir}")
+    log(f"Batch work directory: {work_dir}")
+
+    prepared: list[dict] = []
+    summary: list[dict] = []
+    seen_barcodes: set[str] = set()
+
+    for idx, input_vcf in enumerate(vcfs, start=1):
+        file_key = vcf_basename(input_vcf)
+        log(f"[{idx}/{len(vcfs)}] Processing {input_vcf.name}")
+        record = {
+            "input_vcf": str(input_vcf),
+            "file_key": file_key,
+            "status": "failed",
+            "error": "",
+        }
+        try:
+            samples = read_vcf_sample_names(input_vcf)
+            if not samples:
+                raise ValueError("VCF has no genotype sample column")
+
+            vcf_normal_id = args.vcf_normal_id
+            if vcf_normal_id and vcf_normal_id not in samples:
+                raise ValueError(
+                    f"--vcf-normal-id {vcf_normal_id!r} not found; VCF samples={samples}"
+                )
+
+            if args.vcf_tumor_id:
+                if args.vcf_tumor_id not in samples:
+                    raise ValueError(
+                        f"--vcf-tumor-id {args.vcf_tumor_id!r} not found; VCF samples={samples}"
+                    )
+                vcf_tumor_id = args.vcf_tumor_id
+            elif len(samples) == 1:
+                vcf_tumor_id = samples[0]
+            elif vcf_normal_id and len(samples) == 2:
+                # Common tumor-normal layout: when the same normal column name is used
+                # across files, infer the other genotype column as the tumor.
+                vcf_tumor_id = next(s for s in samples if s != vcf_normal_id)
+            else:
+                raise ValueError(
+                    "VCF contains multiple genotype samples. In directory mode, either provide "
+                    "a common --vcf-tumor-id, provide --vcf-normal-id for a two-sample tumor-normal "
+                    "VCF, or split to one tumor per VCF. "
+                    f"Samples={samples}"
+                )
+
+            tumor_barcode = file_key if args.batch_sample_id_source == "filename" else vcf_tumor_id
+            if tumor_barcode in seen_barcodes:
+                raise ValueError(
+                    f"Duplicate Tumor_Sample_Barcode {tumor_barcode!r}. "
+                    "Use --batch-sample-id-source filename if VCF sample names are reused."
+                )
+            seen_barcodes.add(tumor_barcode)
+
+            safe_label = re.sub(r"[^A-Za-z0-9_.-]+", "_", file_key) or f"sample_{idx}"
+            safe_dir_name = f"{idx:04d}_{safe_label}"
+            sample_dir = work_dir / safe_dir_name
+            staged_vcf = stage_plain_vcf(input_vcf, sample_dir)
+            maf_path = sample_dir / f"{safe_dir_name}.vcf2maf.maf"
+            if maf_path.exists():
+                maf_path.unlink()
+
+            sample_args = argparse.Namespace(**vars(args))
+            sample_args.input_vcf = str(staged_vcf)
+            sample_args.tumor_id = tumor_barcode
+            sample_args.vcf_tumor_id = vcf_tumor_id
+            sample_args.normal_id = vcf_normal_id
+            sample_args.vcf_normal_id = vcf_normal_id
+            if args.tmp_dir is None:
+                sample_args.tmp_dir = str(sample_dir / "tmp")
+                Path(sample_args.tmp_dir).mkdir(parents=True, exist_ok=True)
+
+            run_vcf2maf(sample_args, maf_path)
+            df, qc = prepare_features_before_alphamissense(sample_args, maf_path)
+
+            keys, _ = generate_alphamissense_lookup_keys(df)
+            prepared.append({
+                "input_vcf": input_vcf,
+                "file_key": file_key,
+                "sample_dir": sample_dir,
+                "tumor_barcode": tumor_barcode,
+                "vcf_tumor_id": vcf_tumor_id,
+                "maf_path": maf_path,
+                "df": df,
+                "qc": qc,
+                "lookup_keys": keys,
+            })
+            record.update({
+                "status": "prepared",
+                "tumor_sample_barcode": tumor_barcode,
+                "vcf_tumor_id": vcf_tumor_id,
+                "input_rows": qc.get("input_rows", 0),
+                "missense_rows": qc.get("missense_rows", 0),
+            })
+        except Exception as exc:
+            record["error"] = f"{type(exc).__name__}: {exc}"
+            log(f"FAILED {input_vcf.name}: {record['error']}")
+            if args.fail_fast:
+                raise
+        summary.append(record)
+
+    if not prepared:
+        summary_path = (
+            Path(args.batch_summary).expanduser().resolve()
+            if args.batch_summary
+            else Path(str(output) + ".batch_summary.tsv")
+        )
+        pd.DataFrame(summary).to_csv(summary_path, sep="\t", index=False)
+        raise RuntimeError("No VCFs completed the vcf2maf/pre-AlphaMissense stage")
+
+    all_keys: set[str] = set()
+    for item in prepared:
+        all_keys.update(item["lookup_keys"])
+    log(
+        f"Scanning AlphaMissense once for {len(all_keys):,} unique variants "
+        f"across {len(prepared):,} prepared sample(s)"
+    )
+    am_path = Path(args.alphamissense_file).expanduser().resolve()
+    found_scores, found_classes = scan_alphamissense_database(
+        all_keys,
+        db_path=am_path,
+        chunk_size=args.alphamissense_chunk_size,
+    )
+
+    finals: list[pd.DataFrame] = []
+    summary_by_input = {row["input_vcf"]: row for row in summary}
+    successful_samples = 0
+
+    for item in prepared:
+        record = summary_by_input[str(item["input_vcf"])]
+        try:
+            annotated, am_stats = apply_alphamissense_map(
+                item["df"], found_scores, found_classes
+            )
+            qc = item["qc"]
+            qc.update(am_stats)
+            final, payload = finalize_features(annotated, qc, allow_empty=True)
+
+            annotated_path = item["sample_dir"] / f"{item['file_key']}.annotated.tsv"
+            final_path = item["sample_dir"] / f"{item['file_key']}.mmrl.tsv"
+            qc_path = item["sample_dir"] / f"{item['file_key']}.qc.json"
+            payload["annotated"].to_csv(annotated_path, sep="\t", index=False)
+            final.to_csv(final_path, sep="\t", index=False)
+            write_json(qc_path, payload["qc"])
+
+            record.update({
+                "status": "ok" if not final.empty else "empty",
+                "error": "" if not final.empty else "No complete MMRL rows after filtering",
+                "alphamissense_matched_keys": qc.get("alphamissense_matched_keys", 0),
+                "alphamissense_non_missing": qc.get("alphamissense_non_missing", 0),
+                "final_rows": qc.get("final_rows", 0),
+                "maf_output": str(item["maf_path"]),
+                "annotated_output": str(annotated_path),
+                "sample_output": str(final_path),
+                "qc_output": str(qc_path),
+            })
+            if not final.empty:
+                finals.append(final)
+                successful_samples += 1
+        except Exception as exc:
+            record["status"] = "failed"
+            record["error"] = f"{type(exc).__name__}: {exc}"
+            log(f"FAILED finalization {item['file_key']}: {record['error']}")
+            if args.fail_fast:
+                raise
+
+    summary_path = (
+        Path(args.batch_summary).expanduser().resolve()
+        if args.batch_summary
+        else Path(str(output) + ".batch_summary.tsv")
+    )
+    pd.DataFrame(summary).to_csv(summary_path, sep="\t", index=False)
+    log(f"Batch summary: {summary_path}")
+
+    if not finals:
+        raise RuntimeError("Batch completed, but no sample produced complete MMRL rows")
+
+    combined = pd.concat(finals, ignore_index=True)
+    combined.to_csv(output, sep="\t", index=False)
+    log(
+        f"Combined MMRL input: {output} ({len(combined):,} rows, "
+        f"{successful_samples:,} sample(s))"
+    )
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -493,10 +943,18 @@ def parse_args() -> argparse.Namespace:
     )
 
     src = parser.add_mutually_exclusive_group(required=True)
-    src.add_argument("--input-vcf", help="Somatic VCF/VCF.GZ input")
+    src.add_argument("--input-vcf", help="Single somatic VCF/VCF.GZ input")
+    src.add_argument(
+        "--input-vcf-dir",
+        help="Directory of VCF/VCF.GZ files; one tumor VCF per file by default",
+    )
     src.add_argument("--input-maf", help="Existing MAF/TSV input")
 
-    parser.add_argument("--output", required=True, help="Final MMRL input TSV")
+    parser.add_argument(
+        "--output",
+        required=True,
+        help="Final MMRL TSV; in directory mode this is the combined multi-sample table",
+    )
     parser.add_argument(
         "--ref-fasta",
         required=True,
@@ -533,18 +991,56 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--verbose-vcf2maf", action="store_true")
 
-    # AlphaMissense
+    # VCF-directory batch options
+    parser.add_argument(
+        "--recursive",
+        action="store_true",
+        help="Recursively discover VCF files under --input-vcf-dir",
+    )
+    parser.add_argument(
+        "--batch-work-dir",
+        help="Per-sample MAF/annotated/QC work directory (default: <output>.batch)",
+    )
+    parser.add_argument(
+        "--batch-summary",
+        help="Batch summary TSV (default: <output>.batch_summary.tsv)",
+    )
+    parser.add_argument(
+        "--batch-sample-id-source",
+        choices=["vcf", "filename"],
+        default="vcf",
+        help=(
+            "Tumor_Sample_Barcode source in directory mode: VCF genotype sample name "
+            "or VCF filename stem (default: vcf)"
+        ),
+    )
+    parser.add_argument(
+        "--fail-fast",
+        action="store_true",
+        help="Stop directory mode at the first failed VCF instead of continuing",
+    )
+
+    # AlphaMissense (direct lookup; not a VEP plugin)
     parser.add_argument(
         "--alphamissense-file",
         help=(
-            "Tabix-indexed AlphaMissense hg19/hg38 TSV.GZ for the VEP plugin. "
-            "Recommended for --input-vcf."
+            "AlphaMissense hg19/hg38 TSV/TSV.GZ/BGZ. The script directly annotates "
+            "CHROM:POS:REF:ALT after vcf2maf; no VEP AlphaMissense plugin is used."
         ),
     )
     parser.add_argument(
         "--alphamissense-column",
         default="am_pathogenicity",
-        help="Pathogenicity-score column in an existing MAF (default: am_pathogenicity)",
+        help=(
+            "Pathogenicity-score column in an existing MAF when "
+            "--alphamissense-file is not supplied (default: am_pathogenicity)"
+        ),
+    )
+    parser.add_argument(
+        "--alphamissense-chunk-size",
+        type=int,
+        default=1_000_000,
+        help="Rows per AlphaMissense database chunk for direct lookup (default: 1000000)",
     )
 
     # Filtering / protein position fallback
@@ -575,14 +1071,39 @@ def parse_args() -> argparse.Namespace:
     )
 
     args = parser.parse_args()
-    if args.input_vcf and not args.ncbi_build:
-        parser.error("--ncbi-build is required with --input-vcf")
+    vcf_mode = bool(args.input_vcf or args.input_vcf_dir)
+    if vcf_mode and not args.ncbi_build:
+        parser.error("--ncbi-build is required with --input-vcf/--input-vcf-dir")
     if args.input_vcf and not args.tumor_id:
         parser.error("--tumor-id is required with --input-vcf so sample IDs are preserved correctly")
-    if args.input_vcf and not args.alphamissense_file:
-        parser.error("--alphamissense-file is required with --input-vcf to generate am_pathogenicity")
+    if vcf_mode and not args.alphamissense_file:
+        parser.error("--alphamissense-file is required with VCF input to generate am_pathogenicity")
+    if args.input_vcf_dir and args.tumor_id:
+        parser.error(
+            "--tumor-id is a single-file option. Directory mode automatically uses the VCF "
+            "sample name, or use --batch-sample-id-source filename."
+        )
+    if args.input_vcf_dir and args.normal_id:
+        parser.error(
+            "--normal-id is a single-file option. In directory mode, use --vcf-normal-id "
+            "only when the same normal genotype-column name is present in every VCF."
+        )
+    if args.input_vcf_dir and args.maf_output:
+        parser.error("--maf-output is only valid for single --input-vcf mode")
+    if args.input_vcf_dir and args.annotated_output:
+        parser.error(
+            "--annotated-output is only valid outside directory mode; per-sample annotated "
+            "files are written automatically under --batch-work-dir."
+        )
+    if args.input_vcf_dir and args.qc_output:
+        parser.error(
+            "--qc-output is only valid outside directory mode; per-sample QC files and a "
+            "batch summary are written automatically."
+        )
     if args.vep_forks < 1:
         parser.error("--vep-forks must be >= 1")
+    if args.alphamissense_chunk_size < 1:
+        parser.error("--alphamissense-chunk-size must be >= 1")
     return args
 
 
@@ -590,6 +1111,10 @@ def main() -> None:
     args = parse_args()
     output = Path(args.output).expanduser().resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
+
+    if args.input_vcf_dir:
+        run_vcf_directory(args, output)
+        return
 
     if args.input_vcf:
         if args.maf_output:
@@ -615,9 +1140,7 @@ def main() -> None:
         if args.qc_output
         else Path(str(output) + ".qc.json")
     )
-    qc_output.parent.mkdir(parents=True, exist_ok=True)
-    with open(qc_output, "w") as handle:
-        json.dump(payload["qc"], handle, indent=2, ensure_ascii=False)
+    write_json(qc_output, payload["qc"])
     log(f"QC report: {qc_output}")
 
 
