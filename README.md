@@ -1,6 +1,6 @@
 # Missense Mutation Embedding Extraction
 
-<img src="C:\Users\41378\Desktop\个性化WES模型\202605结果整理\主要分析代码\github\mmrl.png" alt="mmrl" style="zoom:50%;" />
+<img src="mmrl.png" alt="mmrl" style="zoom:50%;" />
 
 Prepare somatic missense-mutation features for **MMRL** and extract one embedding per tumor sample.
 
